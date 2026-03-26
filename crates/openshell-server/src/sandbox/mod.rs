@@ -921,14 +921,20 @@ fn sandbox_template_to_k8s(
     // processes to resolve binary identity for network policy enforcement),
     // and SYSLOG (for reading /dev/kmsg to surface bypass detection diagnostics).
     // This mirrors the capabilities used by `mise run sandbox`.
-    container.insert(
-        "securityContext".to_string(),
-        serde_json::json!({
-            "capabilities": {
-                "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
-            }
-        }),
-    );
+    //
+    // When the image name contains "pandafs", the sandbox needs privileged mode
+    // to access /dev/fuse for the FUSE filesystem mount. Production should use
+    // explicit device allowlisting instead of privileged mode.
+    let needs_fuse = image.contains("pandafs");
+    let mut sec_ctx = serde_json::json!({
+        "capabilities": {
+            "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
+        }
+    });
+    if needs_fuse {
+        sec_ctx["privileged"] = serde_json::json!(true);
+    }
+    container.insert("securityContext".to_string(), sec_ctx);
 
     // Mount client TLS secret for mTLS to the server.
     if !client_tls_secret_name.is_empty() {

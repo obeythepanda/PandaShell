@@ -213,6 +213,13 @@ pub async fn run_sandbox(
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
 
+    // Mount PandaFS FUSE filesystem if PANDAFS_TENANT_ID is set.
+    // The FUSE daemon runs as root (supervisor context) and provides
+    // transparent encryption at the mountpoint. The agent process
+    // accesses it as a normal directory via --allow-root.
+    #[cfg(target_os = "linux")]
+    let _pandafs_guard = mount_pandafs_if_configured()?;
+
     // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
     // The CA cert is written to disk so sandbox processes can trust it.
     let (tls_state, ca_file_paths) = if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -1232,6 +1239,187 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
 #[cfg(not(unix))]
 fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
     Ok(())
+}
+
+/// Guard that kills the PandaFS FUSE daemon when dropped.
+#[cfg(target_os = "linux")]
+struct PandaFsGuard {
+    child: std::process::Child,
+    mountpoint: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PandaFsGuard {
+    fn drop(&mut self) {
+        info!(mountpoint = %self.mountpoint.display(), "Unmounting PandaFS");
+        // fusermount3 -u is the clean FUSE unmount
+        let _ = std::process::Command::new("fusermount3")
+            .args(["-u", &self.mountpoint.to_string_lossy()])
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Mount PandaFS FUSE filesystem if `PANDAFS_TENANT_ID` is set.
+///
+/// Reads configuration from environment variables:
+/// - `PANDAFS_TENANT_ID` — tenant identifier (required to activate)
+/// - `PANDAFS_DATA_DIR` — backing store directory (default: `/data/pandafs`)
+/// - `PANDAFS_BIN` — path to pandafs binary (default: `/usr/local/bin/pandafs`)
+///
+/// The FUSE daemon runs as root in the supervisor context with `--allow-root`
+/// so the unprivileged agent process can access the mountpoint.
+#[cfg(target_os = "linux")]
+fn mount_pandafs_if_configured() -> Result<Option<PandaFsGuard>> {
+    let tenant_id = match std::env::var("PANDAFS_TENANT_ID") {
+        Ok(id) if !id.is_empty() => id,
+        _ => return Ok(None),
+    };
+
+    let data_dir = std::env::var("PANDAFS_DATA_DIR").unwrap_or_else(|_| "/data/pandafs".into());
+    let pandafs_bin =
+        std::env::var("PANDAFS_BIN").unwrap_or_else(|_| "/usr/local/bin/pandafs".into());
+    let mountpoint = std::path::PathBuf::from(format!("/pandafs/{tenant_id}"));
+
+    info!(
+        tenant_id = %tenant_id,
+        data_dir = %data_dir,
+        mountpoint = %mountpoint.display(),
+        "Mounting PandaFS FUSE filesystem"
+    );
+
+    // Ensure backing store and mountpoint directories exist
+    std::fs::create_dir_all(&data_dir).into_diagnostic()?;
+    std::fs::create_dir_all(&mountpoint).into_diagnostic()?;
+
+    // Ensure /dev/fuse device exists (required for FUSE).
+    // Container runtimes don't always provide it, but SYS_ADMIN capability
+    // allows us to create it (major 10, minor 229).
+    let fuse_dev = std::path::Path::new("/dev/fuse");
+    if !fuse_dev.exists() {
+        info!("Creating /dev/fuse device node");
+        let status = std::process::Command::new("mknod")
+            .args(["/dev/fuse", "c", "10", "229"])
+            .status()
+            .into_diagnostic()?;
+        if !status.success() {
+            return Err(miette::miette!(
+                "Failed to create /dev/fuse device node (exit code {:?}). \
+                 Ensure the container has CAP_SYS_ADMIN.",
+                status.code()
+            ));
+        }
+        // Make it accessible
+        let _ = std::process::Command::new("chmod")
+            .args(["666", "/dev/fuse"])
+            .status();
+    }
+
+    // Provision tenant if needed (idempotent)
+    let provision_status = std::process::Command::new(&pandafs_bin)
+        .args([
+            "--data-dir",
+            &data_dir,
+            "provision",
+            "--tenant-id",
+            &tenant_id,
+        ])
+        .status()
+        .into_diagnostic()?;
+
+    if !provision_status.success() {
+        return Err(miette::miette!(
+            "PandaFS tenant provision failed with exit code {:?}",
+            provision_status.code()
+        ));
+    }
+
+    // Resolve sandbox user UID/GID so FUSE files are owned by the agent process
+    let sandbox_uid = nix::unistd::User::from_name("sandbox")
+        .into_diagnostic()?
+        .map(|u| u.uid.as_raw().to_string())
+        .unwrap_or_else(|| "1000".to_string());
+    let sandbox_gid = nix::unistd::Group::from_name("sandbox")
+        .into_diagnostic()?
+        .map(|g| g.gid.as_raw().to_string())
+        .unwrap_or_else(|| "1000".to_string());
+
+    // Start FUSE daemon as a background process
+    let mut child = std::process::Command::new(&pandafs_bin)
+        .args([
+            "--data-dir",
+            &data_dir,
+            "mount",
+            "--tenant-id",
+            &tenant_id,
+            "--mountpoint",
+            &mountpoint.to_string_lossy(),
+            "--allow-other",
+            "--uid",
+            &sandbox_uid,
+            "--gid",
+            &sandbox_gid,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .into_diagnostic()?;
+
+    // Poll until the mountpoint is ready (up to 10 seconds)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        // Check if the FUSE daemon exited early (crash)
+        if let Some(status) = child.try_wait().into_diagnostic()? {
+            let stderr = child
+                .stderr
+                .take()
+                .and_then(|mut s| {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut s, &mut buf).ok()?;
+                    Some(buf)
+                })
+                .unwrap_or_default();
+            return Err(miette::miette!(
+                "PandaFS FUSE daemon exited with {:?} before mount was ready.\nstderr: {}",
+                status.code(),
+                stderr
+            ));
+        }
+
+        let status = std::process::Command::new("mountpoint")
+            .args(["-q", &mountpoint.to_string_lossy()])
+            .status();
+        if matches!(status, Ok(s) if s.success()) {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            // Kill the daemon and capture stderr
+            let _ = child.kill();
+            let stderr = child
+                .stderr
+                .take()
+                .and_then(|mut s| {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut s, &mut buf).ok()?;
+                    Some(buf)
+                })
+                .unwrap_or_default();
+            return Err(miette::miette!(
+                "PandaFS FUSE mount at {} did not become ready within 10s.\nstderr: {}",
+                mountpoint.display(),
+                stderr
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    info!(
+        mountpoint = %mountpoint.display(),
+        "PandaFS FUSE mount ready"
+    );
+
+    Ok(Some(PandaFsGuard { child, mountpoint }))
 }
 
 /// Background loop that polls the server for policy updates.
